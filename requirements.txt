@@ -1,7 +1,2 @@
 requests==2.32.3
-torch==2.5.1
-transformers==4.46.3
-diffusers==0.26.3
-accelerate==0.27.2
-scipy
-ftfy
+psutil==6.1.0
