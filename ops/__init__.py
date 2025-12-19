@@ -6,10 +6,10 @@ import importlib
 import os
 import traceback
 
-# Global registry of ops
+# Global registry of ops (populated by @register_op decorators)
 OPS_REGISTRY: Dict[str, Callable[..., Any]] = {}
 
-# Track import/load errors so CI doesn't explode on a single bad op
+# Track import/load errors so runtime + CI can diagnose quickly
 OPS_LOAD_ERRORS: List[Tuple[str, str]] = []  # (module, error_string)
 
 
@@ -18,8 +18,8 @@ def register_op(name: str):
     Decorator to register an op handler function.
 
     Expectations:
-      - ops should be importable (so decorators run)
-      - op names should be unique
+      - ops are importable (so decorators run)
+      - op names are unique
     """
     def decorator(fn: Callable[..., Any]):
         prev = OPS_REGISTRY.get(name)
@@ -40,33 +40,35 @@ def register_op(name: str):
     return decorator
 
 
+def _enabled_ops() -> set[str]:
+    """
+    Ops enabled for this agent instance.
+
+    - TASKS can be: "echo,map_tokenize,map_summarize"
+    - If TASKS is empty, defaults to all ops in OP_TO_MODULE (CPU-safe allow-list).
+    """
+    tasks = os.getenv("TASKS", "").strip()
+    if not tasks:
+        return set(OP_TO_MODULE.keys())
+    return {t.strip() for t in tasks.split(",") if t.strip()}
+
+
 def list_ops() -> List[str]:
-    """Return sorted list of registered op names."""
-    return sorted(OPS_REGISTRY.keys())
-
-
-def get_op(name: str) -> Callable[..., Any]:
     """
-    Return the handler function for a given op name.
-    Raises ValueError (kept for compatibility with existing agent code paths).
+    Return sorted list of enabled op names.
+
+    Note: With lazy imports, an op may be listed as enabled even if it hasn't been imported yet.
     """
-    fn = OPS_REGISTRY.get(name)
-    if fn is None:
-        # Include load errors to make debugging obvious at runtime
-        if OPS_LOAD_ERRORS:
-            errs = "; ".join([f"{m} => {e}" for (m, e) in OPS_LOAD_ERRORS[:10]])
-            more = "" if len(OPS_LOAD_ERRORS) <= 10 else f" (+{len(OPS_LOAD_ERRORS)-10} more)"
-            raise ValueError(
-                f"Unknown op {name!r}. Registered ops: {list_ops()}. "
-                f"Also saw op import errors: {errs}{more}"
-            )
-        raise ValueError(f"Unknown op {name!r}. Registered ops: {list_ops()}")
-    return fn
+    enabled = _enabled_ops()
+    return sorted([op for op in enabled if op in OP_TO_MODULE])
 
 
 def try_get_op(name: str) -> Optional[Callable[..., Any]]:
-    """Helper: return op or None (no exception)."""
-    return OPS_REGISTRY.get(name)
+    """Helper: return op handler or None (no exception)."""
+    try:
+        return get_op(name)
+    except Exception:
+        return None
 
 
 def _import_op_module(mod: str) -> None:
@@ -74,10 +76,9 @@ def _import_op_module(mod: str) -> None:
     Import ops.<mod> so its @register_op decorators run.
 
     Behavior:
-      - Logs each import attempt (so CI shows progress).
-      - On failure: records the error AND prints full traceback (so we can fix fast).
-      - Does NOT raise: keeps 'import ops' alive in runtime environments.
-        (If you want CI to hard-fail on first bad op, change the last line to: raise)
+      - Logs each import attempt.
+      - On failure: records the error AND prints traceback.
+      - Does NOT raise: keeps runtime alive; get_op() will surface errors if op requested.
     """
     try:
         print(f"[ops] importing ops.{mod}", flush=True)
@@ -89,23 +90,61 @@ def _import_op_module(mod: str) -> None:
         traceback.print_exc()
 
 
-# Import op modules so their @register_op decorators run.
-# NOTE: this list should match actual filenames in ops/.
-# If you rename a module, update this list.
-_OP_MODULES = [
+# Map op name -> module filename (without .py)
+# This is the CPU-safe allow-list for agent-cpu.
+OP_TO_MODULE: Dict[str, str] = {
     # Core ops
-    "echo",
-    "map_tokenize",
-    "map_summarize",
-    "csv_shard",
-    "risk_accumulate",
-    "sat_verify",
+    "echo": "echo",
+    "map_tokenize": "map_tokenize",
+    "map_summarize": "map_summarize",
 
-    # Added ops
-    "fibonacci",
-    "prime_factor",
-    "subset_sum",
-]
+    # CSV shard (support either op name, depending on what controller submits)
+    "csv_shard": "csv_shard",
+    "read_csv_shard": "csv_shard",
 
-for _m in _OP_MODULES:
-    _import_op_module(_m)
+    # Math/IO
+    "risk_accumulate": "risk_accumulate",
+    "fibonacci": "fibonacci",
+    "prime_factor": "prime_factor",
+
+    # Stress/verification ops (keep capped in implementation!)
+    "sat_verify": "sat_verify",
+    "subset_sum": "subset_sum",
+}
+
+
+def get_op(name: str) -> Callable[..., Any]:
+    """
+    Return the handler function for a given op name.
+
+    Lazy-loads the underlying module ONLY when the op is requested,
+    and ONLY if the op is enabled by TASKS and present in OP_TO_MODULE.
+
+    Raises ValueError (kept for compatibility with existing agent code paths).
+    """
+    # If not registered yet, try to import its module (lazy)
+    if name not in OPS_REGISTRY:
+        enabled = _enabled_ops()
+
+        if name not in enabled:
+            raise ValueError(f"Op {name!r} disabled by TASKS. Enabled: {sorted(enabled)}")
+
+        mod = OP_TO_MODULE.get(name)
+        if mod is None:
+            raise ValueError(f"Unknown op {name!r}. Enabled: {list_ops()}")
+
+        _import_op_module(mod)
+
+    fn = OPS_REGISTRY.get(name)
+    if fn is None:
+        # Include load errors to make debugging obvious at runtime
+        if OPS_LOAD_ERRORS:
+            errs = "; ".join([f"{m} => {e}" for (m, e) in OPS_LOAD_ERRORS[:10]])
+            more = "" if len(OPS_LOAD_ERRORS) <= 10 else f" (+{len(OPS_LOAD_ERRORS)-10} more)"
+            raise ValueError(
+                f"Unknown or failed op {name!r}. Registered ops: {sorted(OPS_REGISTRY.keys())}. "
+                f"Also saw op import errors: {errs}{more}"
+            )
+        raise ValueError(f"Unknown op {name!r}. Registered ops: {sorted(OPS_REGISTRY.keys())}")
+
+    return fn
