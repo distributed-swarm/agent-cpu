@@ -1,3 +1,4 @@
+# app.py
 import os
 import time
 import socket
@@ -14,12 +15,15 @@ except ImportError:
     psutil = None
 
 from worker_sizing import build_worker_profile
-from ops import list_ops, get_op  # plugin-based ops registry
+from ops import list_ops, get_op  # plugin-based ops registry (lazy-loaded)
 
 # ---------------- config ----------------
 
 CONTROLLER_URL = os.getenv("CONTROLLER_URL", "http://controller:8080").rstrip("/")
 AGENT_NAME = os.getenv("AGENT_NAME", socket.gethostname())
+
+# If your controller uses /api/* routes, set API_PREFIX=/api
+API_PREFIX = os.getenv("API_PREFIX", "").rstrip("/")
 
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_INTERVAL", "30"))
 TASK_WAIT_MS = int(os.getenv("TASK_WAIT_MS", "2000"))
@@ -61,9 +65,6 @@ if AGENT_LABELS_RAW.strip():
 
 # Always include worker_profile in labels for the controller
 BASE_LABELS["worker_profile"] = WORKER_PROFILE
-
-# CAPABILITIES now come from plugin registry (ops/)
-CAPABILITIES: Dict[str, Any] = {"ops": list_ops()}
 
 # ---------------- rate-limited logging ----------------
 
@@ -125,7 +126,7 @@ _session = requests.Session()
 def _url(path: str) -> str:
     if not path.startswith("/"):
         path = "/" + path
-    return f"{CONTROLLER_URL}{path}"
+    return f"{CONTROLLER_URL}{API_PREFIX}{path}"
 
 
 def _post_json(path: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -162,12 +163,13 @@ def _get_json(path: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _agent_envelope() -> Dict[str, Any]:
-    # Note: WORKER_PROFILE is computed once at startup (good enough for now).
-    # If you ever hot-plug GPUs, we can recompute periodically.
+    # Compute capabilities at envelope time so it's never stale.
+    capabilities: Dict[str, Any] = {"ops": list_ops()}
+
     return {
         "agent": AGENT_NAME,
         "labels": BASE_LABELS,
-        "capabilities": CAPABILITIES,
+        "capabilities": capabilities,
         "worker_profile": WORKER_PROFILE,
         "metrics": _collect_metrics(),
     }
@@ -190,17 +192,15 @@ def heartbeat_loop() -> None:
 def _execute_op(op: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Contract with ops handlers:
-      - handler(payload: Dict[str, Any]) -> Dict[str, Any]
+      - handler(payload: Dict[str, Any]) -> Dict[str, Any] or any value
       - returned dict SHOULD include "ok": bool (missing => assume ok=True)
       - may include "error": str on failure
     """
     try:
         fn = get_op(op)
-    except Exception:
-        fn = None
-
-    if fn is None:
-        return {"ok": False, "error": f"Unknown op '{op}'"}
+    except Exception as e:
+        # IMPORTANT: preserve the real reason (disabled by TASKS, import error, etc.)
+        return {"ok": False, "error": str(e)}
 
     try:
         result = fn(payload)
@@ -246,7 +246,7 @@ def worker_loop() -> None:
                 "agent": AGENT_NAME,
                 "op": op or "unknown",
                 "ok": False,
-                "result": None,
+                "result": {"ok": False},
                 "error": "Invalid task: missing id/op",
                 "duration_ms": 0.0,
             }
@@ -262,12 +262,13 @@ def worker_loop() -> None:
 
         _record_task_result(duration_ms, ok)
 
+        # Send result_data always; controller can decide what to keep.
         result_payload = {
             "id": job_id,
             "agent": AGENT_NAME,
             "op": op,
             "ok": ok,
-            "result": result_data if ok else None,
+            "result": result_data,
             "error": error_str if not ok else None,
             "duration_ms": duration_ms,
         }
