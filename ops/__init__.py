@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Optional, List, Tuple
 import importlib
+import os
 import traceback
 
 # Global registry of ops
@@ -97,7 +98,6 @@ _OP_MODULES = [
     "map_tokenize",
     "map_summarize",
     "csv_shard",
-    "map_classify",
     "risk_accumulate",
     "sat_verify",
 
@@ -105,7 +105,6 @@ _OP_MODULES = [
     "fibonacci",
     "prime_factor",
     "subset_sum",
-    "map_image_gen",
 ]
 
 for _m in _OP_MODULES:
