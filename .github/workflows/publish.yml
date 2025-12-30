@@ -6,6 +6,7 @@ on:
     paths:
       - Dockerfile
       - app.py
+      - ops_loader.py
       - worker_sizing.py
       - requirements.txt
       - .github/workflows/publish.yml
