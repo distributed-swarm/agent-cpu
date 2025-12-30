@@ -9,7 +9,7 @@ COPY requirements.txt .
 RUN python -m pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-COPY app.py worker_sizing.py .
+COPY app.py worker_sizing.py ops_loader.py .
 COPY ops ./ops
 
 ENV CONTROLLER_URL="http://controller:8080"
