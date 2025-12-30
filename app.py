@@ -44,7 +44,7 @@ except Exception:
     psutil = None
 
 from ops_loader import load_ops
-from worker_sizing import compute_worker_profile
+from worker_sizing import build_worker_profile
 
 # ---------------- config ----------------
 
