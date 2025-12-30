@@ -24,7 +24,7 @@
 #
 # Notes:
 # - Ops implemented in ops/*.py loaded by ops_loader.py
-# - worker_sizing.py supplies compute_worker_profile()
+# - worker_sizing.py supplies build_worker_profile()
 
 import os
 import time
@@ -85,7 +85,7 @@ stop_event = threading.Event()
 
 OPS = load_ops(TASKS)
 
-WORKER_PROFILE = compute_worker_profile(reserved_cores=RESERVED_CORES)
+WORKER_PROFILE = build_worker_profile()
 CPU_PROFILE = WORKER_PROFILE.get("cpu", {})
 USABLE_CORES = int(CPU_PROFILE.get("usable_cores", 1))
 
