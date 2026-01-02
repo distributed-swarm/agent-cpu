@@ -1,62 +1,68 @@
 # ops/map_summarize.py
-from typing import Any, Dict, List, Optional
-
+import os
+import threading
+from typing import Any, Dict, Optional
+import torch
+from transformers import BartTokenizer, BartForConditionalGeneration
 from . import register_op
 
+MODEL_NAME = os.getenv("BART_MODEL", "facebook/bart-large-cnn")
+FORCE_CPU = os.getenv("SUMMARIZE_FORCE_CPU", "1").strip() in ("1", "true", "yes")
 
-def _summarize_placeholder(text: str, max_len: int = 200) -> str:
-    s = text.strip()
-    if len(s) > max_len:
-        s = s[: max_len - 3].rstrip() + "..."
-    return s
+_lock = threading.Lock()
+_model = None
+_tokenizer = None
+_device = "cpu"
 
+def _init_model():
+    global _model, _tokenizer, _device
+    if _model is not None:
+        return
+    
+    with _lock:
+        if _model is not None:
+            return
+        
+        device = "cpu" if FORCE_CPU else ("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[map_summarize CPU] Loading BART on {device}", flush=True)
+        
+        _tokenizer = BartTokenizer.from_pretrained(MODEL_NAME)
+        _model = BartForConditionalGeneration.from_pretrained(MODEL_NAME)
+        _model.to(device)
+        _model.eval()
+        _device = device
 
 @register_op("map_summarize")
 def handle(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Map-style summarization handler (placeholder truncation).
-
-    Accepts either:
-      - {"items": [ {id,text|document|body}, ... ]}
-      - {"text": "..."}  (single convenience)
-
-    Returns:
-      {"ok": true, "items": [{"id": "...", "summary": "..."}, ...]}
-    or:
-      {"ok": false, "error": "..."}
-    """
-    if payload is None:
-        payload = {}
-
-    # Convenience: single text payload
-    if "text" in payload and payload.get("text") is not None and "items" not in payload:
-        text = payload.get("text")
-        if not isinstance(text, str) or not text.strip():
-            return {"ok": False, "error": "map_summarize: payload.text must be a non-empty string"}
-        return {"ok": True, "items": [{"id": payload.get("id"), "summary": _summarize_placeholder(text)}]}
-
-    items = payload.get("items") or []
-    if not isinstance(items, list):
-        return {"ok": False, "error": "map_summarize: payload.items must be a list"}
-
-    results: List[Dict[str, Any]] = []
-
-    for idx, item in enumerate(items):
-        item_id = None
-        text = None
-
-        if isinstance(item, dict):
-            item_id = item.get("id")
-            text = item.get("text") or item.get("document") or item.get("body")
-        else:
-            text = str(item)
-
-        if not isinstance(text, str) or not text.strip():
-            return {
-                "ok": False,
-                "error": f"map_summarize: item[{idx}] missing non-empty text in text/document/body",
-            }
-
-        results.append({"id": item_id, "summary": _summarize_placeholder(text)})
-
-    return {"ok": True, "items": results}
+    _init_model()
+    
+    if not payload:
+        return {"ok": False, "error": "empty payload"}
+    
+    text = payload.get("text", "").strip()
+    if not text:
+        return {"ok": False, "error": "no text provided"}
+    
+    max_length = int(payload.get("max_length", 130))
+    min_length = int(payload.get("min_length", 30))
+    
+    inputs = _tokenizer([text], max_length=1024, truncation=True, return_tensors="pt")
+    inputs = {k: v.to(_device) for k, v in inputs.items()}
+    
+    with torch.no_grad():
+        summary_ids = _model.generate(
+            inputs["input_ids"],
+            max_length=max_length,
+            min_length=min_length,
+            num_beams=4,
+            early_stopping=True
+        )
+    
+    summary = _tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+    
+    return {
+        "ok": True,
+        "summary": summary,
+        "device": _device,
+        "model": MODEL_NAME
+    }
