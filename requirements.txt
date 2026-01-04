@@ -1,6 +1,7 @@
 requests==2.32.3
 psutil==6.1.0
+scipy
 ftfy
-# OCR Tools (Required for the invoice op)
+# OCR Tools
 pytesseract
 pdf2image
