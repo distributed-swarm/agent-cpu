@@ -10,6 +10,8 @@ WORKDIR /app
 # poppler-utils is required for pdf2image
 # tesseract-ocr-eng restricts it to English only (saves ~20MB vs full tesseract)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
     tesseract-ocr-eng \
     poppler-utils \
  && rm -rf /var/lib/apt/lists/*
