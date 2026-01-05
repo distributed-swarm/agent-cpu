@@ -11,6 +11,7 @@ WORKDIR /app
 # tesseract-ocr-eng restricts it to English only (saves ~20MB vs full tesseract)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    jq \
     ca-certificates \
     tesseract-ocr-eng \
     poppler-utils \
