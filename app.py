@@ -46,6 +46,8 @@ import socket
 import random
 import signal
 import threading
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 from typing import Optional, Dict, Any, Tuple, List
 
 import requests
@@ -115,6 +117,16 @@ OPS = load_ops(TASKS)
 WORKER_PROFILE = build_worker_profile()
 CPU_PROFILE = WORKER_PROFILE.get("cpu", {})
 USABLE_CORES = int(CPU_PROFILE.get("usable_cores", 1))
+
+# ---------------- CPU execution pool ----------------
+
+# Use processes for true CPU parallelism (bypasses GIL)
+_CPU_WORKERS = max(1, USABLE_CORES)
+
+_CPU_POOL = ProcessPoolExecutor(
+    max_workers=_CPU_WORKERS,
+    mp_context=multiprocessing.get_context("fork"),
+)
 
 # "Target inflight" is your pipeline fill number (cores * factor).
 # This is not a static worker count; it is the scale region to explore.
@@ -409,7 +421,14 @@ def _run_task(task: Dict[str, Any]) -> None:
     _inflight_inc()
     try:
         fn = OPS[op]
-        out = fn(payload)
+        # Run CPU work in the process pool (true parallelism; bypasses GIL)
+        try:
+            fut = _CPU_POOL.submit(fn, payload)
+            out = fut.result()
+        except NameError:
+            # Pool not defined for some reason; fall back to in-thread execution
+            out = fn(payload)
+
         _post_result(task, status="ok", result=out, error=None)
     except Exception as e:
         _post_result(task, status="error", result=None, error=str(e))
