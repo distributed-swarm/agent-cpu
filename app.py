@@ -591,9 +591,14 @@ def main() -> None:
         every=999999,
     )
 
-    while not stop_event.is_set():
-        time.sleep(0.5)
-
+    try:
+        while not stop_event.is_set():
+            time.sleep(0.5)
+    finally:
+        try:
+            _CPU_POOL.shutdown(wait=True, cancel_futures=True)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
