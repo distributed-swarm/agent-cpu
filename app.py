@@ -1,43 +1,12 @@
-# app.py
-# MYZEL CPU Agent (dynamic workers) — controller-aligned
+# app.py — MYZEL CPU Agent (controller-aligned, no fantasy endpoints)
 #
-# Controller contract:
-#   - Lease task:  GET /api/task?agent=NAME&wait_ms=MS   (also /task)
-#   - Register:    POST /api/agents/register            (also /agents/register)
-#   - Heartbeat:   POST /api/agents/heartbeat           (also /agents/heartbeat)
-#   - Result:      POST /api/result                     (also /result)
+# Contract (what your controller actually serves):
+#   - Register:   POST  {prefix}/agents/register
+#   - Heartbeat:  POST  {prefix}/agents/heartbeat
+#   - Lease task: GET   {prefix}/task?agent=NAME&wait_ms=MS
+#   - Result:     POST  {prefix}/result
 #
-# Dynamic worker design:
-#   - Start with 1 worker loop
-#   - Grow worker count while there are bubbles to fill (recent hits / pressure)
-#   - Allow oversubscription beyond cores using CPU_PIPELINE_FACTOR (default 4)
-#   - Reap workers when idle
-#
-# Env (existing + new):
-#   CONTROLLER_URL      (default http://controller:8080)
-#   API_PREFIX          (default /api)
-#   AGENT_NAME          (default hostname)
-#   TASKS               (comma list; default "echo")
-#   AGENT_LABELS        (k=v,k2=v2)
-#   HEARTBEAT_SEC       (default 3)
-#   WAIT_MS             (default 2000)
-#   LEASE_IDLE_SEC      (default 0.05)
-#   HTTP_TIMEOUT        (default 6)
-#   RESERVED_CORES      (default 4)  # still used by worker_sizing.py
-#
-# Dynamic worker tuning:
-#   CPU_MIN_WORKERS         (default 1)
-#   CPU_PIPELINE_FACTOR     (default 4.0)  # allows > cores
-#   TARGET_CPU_UTIL_PCT     (default 80.0) # scale-up only when below this
-#   SCALE_TICK_SEC          (default 1.0)
-#   IDLE_REAP_TICKS         (default 6)    # consecutive ticks with no work to reap one
-#   SPAWN_STEP              (default 1)    # how many to add per tick when scaling up
-#   REAP_STEP               (default 1)
-#   WORKER_SOFT_GUARD       (optional)     # override guardrail if desired
-#
-# Notes:
-# - Threads are fine for IO/latency hiding; for heavy CPU ops, consider processes later.
-# - Controller doesn’t need worker counts for correctness; this is agent-local autonomy.
+# prefix is typically "/api" (but we auto-detect).
 
 import os
 import time
@@ -47,8 +16,8 @@ import random
 import signal
 import threading
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
 from typing import Optional, Dict, Any, Tuple, List
+from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError
 
 import requests
 
@@ -63,42 +32,53 @@ from worker_sizing import build_worker_profile
 
 # ---------------- config ----------------
 
-CONTROLLER_URL = os.getenv("CONTROLLER_URL", "http://controller:8080").rstrip("/")
-API_PREFIX_RAW = os.getenv("API_PREFIX", "/api").strip()
 AGENT_NAME = os.getenv("AGENT_NAME") or socket.gethostname()
 
 TASKS_RAW = os.getenv("TASKS", "echo")
 TASKS = [t.strip() for t in TASKS_RAW.split(",") if t.strip()]
 
-RESERVED_CORES = int(os.getenv("RESERVED_CORES", "4"))
-
 HEARTBEAT_SEC = float(os.getenv("HEARTBEAT_SEC", "3"))
 WAIT_MS = int(os.getenv("WAIT_MS", "2000"))
 LEASE_IDLE_SEC = float(os.getenv("LEASE_IDLE_SEC", "0.05"))
-
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "6"))
 
-# dynamic tuning
+# scaling knobs (agent-local)
 CPU_MIN_WORKERS = max(1, int(os.getenv("CPU_MIN_WORKERS", "1")))
-CPU_PIPELINE_FACTOR = float(os.getenv("CPU_PIPELINE_FACTOR", "4.0"))
-CPU_PIPELINE_FACTOR = max(1.0, CPU_PIPELINE_FACTOR)
-
-TARGET_CPU_UTIL_PCT = float(os.getenv("TARGET_CPU_UTIL_PCT", "80.0"))
-TARGET_CPU_UTIL_PCT = max(1.0, min(100.0, TARGET_CPU_UTIL_PCT))
-
-SCALE_TICK_SEC = float(os.getenv("SCALE_TICK_SEC", "1.0"))
-SCALE_TICK_SEC = max(0.2, SCALE_TICK_SEC)
-
+CPU_PIPELINE_FACTOR = max(1.0, float(os.getenv("CPU_PIPELINE_FACTOR", "2.0")))
+TARGET_CPU_UTIL_PCT = max(1.0, min(100.0, float(os.getenv("TARGET_CPU_UTIL_PCT", "80.0"))))
+SCALE_TICK_SEC = max(0.2, float(os.getenv("SCALE_TICK_SEC", "1.0")))
 IDLE_REAP_TICKS = max(1, int(os.getenv("IDLE_REAP_TICKS", "6")))
 SPAWN_STEP = max(1, int(os.getenv("SPAWN_STEP", "1")))
 REAP_STEP = max(1, int(os.getenv("REAP_STEP", "1")))
+
+# execution guardrail
+TASK_EXEC_TIMEOUT_SEC = float(os.getenv("TASK_EXEC_TIMEOUT_SEC", "60"))
+
+# labels
+AGENT_LABELS_RAW = os.getenv("AGENT_LABELS", "").strip()
+AGENT_LABELS: Dict[str, Any] = {}
+if AGENT_LABELS_RAW:
+    # allow JSON or k=v,k2=v2
+    try:
+        AGENT_LABELS = json.loads(AGENT_LABELS_RAW)
+        if not isinstance(AGENT_LABELS, dict):
+            AGENT_LABELS = {}
+    except Exception:
+        for part in AGENT_LABELS_RAW.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" in part:
+                k, v = part.split("=", 1)
+                AGENT_LABELS[k.strip()] = v.strip()
+            else:
+                AGENT_LABELS[part] = True
 
 
 # ---------------- logging ----------------
 
 _LOG_LOCK = threading.Lock()
 _last_log: Dict[str, float] = {}
-
 
 def log(msg: str, key: str = "default", every: float = 1.0) -> None:
     now = time.time()
@@ -118,96 +98,42 @@ WORKER_PROFILE = build_worker_profile()
 CPU_PROFILE = WORKER_PROFILE.get("cpu", {})
 USABLE_CORES = int(CPU_PROFILE.get("usable_cores", 1))
 
-# ---------------- CPU execution pool ----------------
-
-# Use processes for true CPU parallelism (bypasses GIL)
-_CPU_WORKERS = max(1, USABLE_CORES)
-
+# process pool for CPU-ish ops
 _CPU_POOL = ProcessPoolExecutor(
-    max_workers=_CPU_WORKERS,
+    max_workers=max(1, USABLE_CORES),
     mp_context=multiprocessing.get_context("fork"),
 )
 
-# "Target inflight" is your pipeline fill number (cores * factor).
-# This is not a static worker count; it is the scale region to explore.
-TARGET_INFLIGHT_WORKERS = max(1, int(round(USABLE_CORES * CPU_PIPELINE_FACTOR)))
+TARGET_INFLIGHT = max(1, int(round(USABLE_CORES * CPU_PIPELINE_FACTOR)))
+SOFT_GUARD = max(CPU_MIN_WORKERS, int(os.getenv("WORKER_SOFT_GUARD", str(TARGET_INFLIGHT * 2))))
 
-# Guardrail (safety), optional override.
-# This is NOT "start this many"; it is "do not runaway into nonsense".
-_guard_override = os.getenv("WORKER_SOFT_GUARD", "").strip()
-if _guard_override:
-    try:
-        WORKER_SOFT_GUARD = max(1, int(_guard_override))
-    except Exception:
-        WORKER_SOFT_GUARD = max(1, TARGET_INFLIGHT_WORKERS * 2)
-else:
-    WORKER_SOFT_GUARD = max(1, TARGET_INFLIGHT_WORKERS * 2)
+_session = requests.Session()
 
-AGENT_LABELS_RAW = os.getenv("AGENT_LABELS", "").strip()
-BASE_LABELS: Dict[str, Any] = {}
-if AGENT_LABELS_RAW:
-    for item in AGENT_LABELS_RAW.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if "=" in item:
-            k, v = item.split("=", 1)
-            BASE_LABELS[k.strip()] = v.strip()
-        else:
-            BASE_LABELS[item] = True
-
-BASE_LABELS["worker_profile"] = WORKER_PROFILE
-
-_current_workers_lock = threading.Lock()
-_current_workers = 0
-
-
-def set_current_workers(n: int) -> None:
-    global _current_workers
-    with _current_workers_lock:
-        _current_workers = n
-
-
-def get_current_workers() -> int:
-    with _current_workers_lock:
-        return _current_workers
-
-
-# worker management (spawn + reap)
-_worker_lock = threading.Lock()
-_worker_threads: Dict[int, threading.Thread] = {}
-_worker_stops: Dict[int, threading.Event] = {}
-
-# pressure/inflight signals
+# signals
 _sig_lock = threading.Lock()
-_hits = 0          # leased a task (work exists)
-_misses = 0        # no task
-_inflight = 0      # currently executing ops
-
+_hits = 0
+_misses = 0
+_inflight = 0
 
 def _note_hit() -> None:
     global _hits
     with _sig_lock:
         _hits += 1
 
-
 def _note_miss() -> None:
     global _misses
     with _sig_lock:
         _misses += 1
-
 
 def _inflight_inc() -> None:
     global _inflight
     with _sig_lock:
         _inflight += 1
 
-
 def _inflight_dec() -> None:
     global _inflight
     with _sig_lock:
         _inflight = max(0, _inflight - 1)
-
 
 def _snap_signals() -> Tuple[int, int, int]:
     global _hits, _misses, _inflight
@@ -217,31 +143,86 @@ def _snap_signals() -> Tuple[int, int, int]:
     return h, m, inf
 
 
+# ---------------- controller discovery ----------------
+
+def _normalize_base(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return ""
+    return u[:-1] if u.endswith("/") else u
+
+def _candidate_bases() -> List[str]:
+    bases: List[str] = []
+    env_base = _normalize_base(os.getenv("CONTROLLER_URL", ""))
+    if env_base:
+        bases.append(env_base)
+
+    # common in-compose service name
+    bases.append("http://controller:8080")
+
+    # linux docker gateway IPs (bridge)
+    bases.append("http://172.17.0.1:8080")
+    bases.append("http://172.18.0.1:8080")
+
+    # sometimes people run it on the host IP and expect containers to route there
+    host_ip = os.getenv("CONTROLLER_HOST_IP", "").strip()
+    if host_ip:
+        bases.append(f"http://{host_ip}:8080")
+
+    # de-dup while preserving order
+    out: List[str] = []
+    seen = set()
+    for b in bases:
+        if b and b not in seen:
+            out.append(b)
+            seen.add(b)
+    return out
+
+def _try_get(base: str, path: str) -> Optional[int]:
+    try:
+        r = _session.get(f"{base}{path}", timeout=min(HTTP_TIMEOUT, 2.5))
+        return r.status_code
+    except Exception:
+        return None
+
+def _pick_controller_base() -> str:
+    for base in _candidate_bases():
+        code = _try_get(base, "/healthz")
+        if code is not None and code < 500:
+            log(f"[agent] controller base = {base}", "base", every=999999)
+            return base
+    # last resort: whatever env said, even if empty
+    base = _normalize_base(os.getenv("CONTROLLER_URL", "http://controller:8080"))
+    log(f"[agent] WARNING: could not probe controller; using {base}", "base_warn", every=999999)
+    return base
+
+CONTROLLER_BASE = _pick_controller_base()
+
+def _detect_prefix() -> str:
+    # prefer /api if it exists
+    for pref in ("/api", ""):
+        code = _try_get(CONTROLLER_BASE, f"{pref}/healthz" if pref else "/healthz")
+        if code is not None and code < 500:
+            log(f"[agent] api prefix = '{pref or '(none)'}'", "prefix", every=999999)
+            return pref
+    return "/api"
+
+API_PREFIX = _detect_prefix()
+
+def _url(path: str) -> str:
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{CONTROLLER_BASE}{path}"
+
+def _api(path: str) -> str:
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{CONTROLLER_BASE}{API_PREFIX}{path}" if API_PREFIX else f"{CONTROLLER_BASE}{path}"
+
+
 # ---------------- HTTP helpers ----------------
 
-_session = requests.Session()
-
-
-def _normalize_prefix(p: str) -> str:
-    if not p:
-        return ""
-    if not p.startswith("/"):
-        p = "/" + p
-    if p.endswith("/"):
-        p = p[:-1]
-    return p
-
-
-API_PREFIX = _normalize_prefix(API_PREFIX_RAW)
-
-FALLBACK_PREFIXES: List[str] = []
-if API_PREFIX:
-    FALLBACK_PREFIXES.append(API_PREFIX)
-FALLBACK_PREFIXES.append("")
-
-
-def _post_json(path: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
-    url = f"{CONTROLLER_URL}{path}"
+def _post_json(url: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
     try:
         r = _session.post(url, json=payload, timeout=HTTP_TIMEOUT)
         ct = r.headers.get("content-type", "")
@@ -251,9 +232,7 @@ def _post_json(path: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
     except Exception as e:
         return 0, str(e)
 
-
-def _get_json(path: str, params: Dict[str, Any]) -> Tuple[int, Any]:
-    url = f"{CONTROLLER_URL}{path}"
+def _get_json(url: str, params: Dict[str, Any]) -> Tuple[int, Any]:
     try:
         r = _session.get(url, params=params, timeout=HTTP_TIMEOUT)
         ct = r.headers.get("content-type", "")
@@ -264,63 +243,9 @@ def _get_json(path: str, params: Dict[str, Any]) -> Tuple[int, Any]:
         return 0, str(e)
 
 
-# ---------------- endpoint selection ----------------
+# ---------------- controller calls ----------------
 
-PATH_REGISTER: Optional[str] = None
-PATH_HEARTBEAT: Optional[str] = None
-PATH_TASK: Optional[str] = None
-PATH_RESULT: Optional[str] = None
-
-
-def _pick_post(candidates: List[str], test_payload: Dict[str, Any]) -> str:
-    for pref in FALLBACK_PREFIXES:
-        for c in candidates:
-            path = f"{pref}{c}"
-            code, _ = _post_json(path, test_payload)
-            if code and code != 404:
-                return path
-    return f"{API_PREFIX}{candidates[0]}"
-
-
-def _pick_get(candidates: List[str], test_params: Dict[str, Any]) -> str:
-    for pref in FALLBACK_PREFIXES:
-        for c in candidates:
-            path = f"{pref}{c}"
-            code, _ = _get_json(path, test_params)
-            if code and code != 404:
-                return path
-    return f"{API_PREFIX}{candidates[0]}"
-
-
-def _probe_paths() -> None:
-    global PATH_REGISTER, PATH_HEARTBEAT, PATH_TASK, PATH_RESULT
-
-    reg_payload = {
-        "agent": AGENT_NAME,
-        "labels": BASE_LABELS,
-        "capabilities": {"ops": TASKS},
-        "metrics": {},
-    }
-
-    hb_payload = {"agent": AGENT_NAME, "metrics": {}}
-    task_params = {"agent": AGENT_NAME, "wait_ms": 0}
-
-    PATH_REGISTER = _pick_post(["/agents/register"], reg_payload)
-    PATH_HEARTBEAT = _pick_post(["/agents/heartbeat"], hb_payload)
-    PATH_TASK = _pick_get(["/task"], task_params)
-
-    PATH_RESULT = f"{API_PREFIX}/result" if API_PREFIX else "/result"
-
-    log(
-        f"[agent] endpoints: register={PATH_REGISTER} heartbeat={PATH_HEARTBEAT} task={PATH_TASK} result_pref={PATH_RESULT}",
-        key="paths",
-        every=999999,
-    )
-
-
-# ---------------- metrics ----------------
-
-def _collect_metrics() -> Dict[str, Any]:
+def _metrics() -> Dict[str, Any]:
     cpu_util = 0.0
     ram_mb = 0.0
     if psutil is not None:
@@ -329,133 +254,132 @@ def _collect_metrics() -> Dict[str, Any]:
             ram_mb = float(psutil.virtual_memory().used / (1024 * 1024))
         except Exception:
             pass
-    return {
-        "cpu_util": cpu_util,
-        "ram_mb": ram_mb,
-        "current_workers": get_current_workers(),
-    }
+    return {"cpu_util": cpu_util, "ram_mb": ram_mb}
 
-
-# ---------------- controller calls ----------------
-
-def _register_once() -> bool:
-    assert PATH_REGISTER is not None
+def register_loop() -> None:
+    url = _api("/agents/register")
     payload = {
         "agent": AGENT_NAME,
-        "labels": BASE_LABELS,
+        "labels": AGENT_LABELS,
         "capabilities": {"ops": TASKS},
-        "metrics": _collect_metrics(),
+        "worker_profile": WORKER_PROFILE,
+        "metrics": _metrics(),
+        "ts": time.time(),
     }
-    code, body = _post_json(PATH_REGISTER, payload)
-    if code == 200:
-        log("[agent] registered ok (normal)", key="reg_ok", every=10.0)
-        return True
-    log(f"[agent] register failed code={code} body={str(body)[:200]}", key="reg_fail", every=2.0)
-    return False
 
+    while not stop_event.is_set():
+        code, body = _post_json(url, payload)
+        if code == 200:
+            log(f"[agent] registered as {AGENT_NAME} ops={TASKS}", "reg_ok", every=999999)
+            return
+        log(f"[agent] register failed code={code} body={str(body)[:240]}", "reg_fail", every=2.0)
+        stop_event.wait(1.0 + random.random() * 0.5)
 
-def _heartbeat() -> None:
-    assert PATH_HEARTBEAT is not None
-    payload = {"agent": AGENT_NAME, "metrics": _collect_metrics()}
-    code, body = _post_json(PATH_HEARTBEAT, payload)
-    if code != 200:
-        log(f"[agent] heartbeat failed code={code} body={str(body)[:200]}", key="hb_fail", every=2.0)
+def heartbeat_loop() -> None:
+    url = _api("/agents/heartbeat")
+    while not stop_event.is_set():
+        payload = {"agent": AGENT_NAME, "metrics": _metrics(), "ts": time.time()}
+        code, body = _post_json(url, payload)
+        if code != 200:
+            log(f"[agent] heartbeat failed code={code} body={str(body)[:160]}", "hb_fail", every=2.0)
+        stop_event.wait(HEARTBEAT_SEC)
 
-
-def _lease_task() -> Optional[Dict[str, Any]]:
-    assert PATH_TASK is not None
+def lease_task() -> Optional[Dict[str, Any]]:
+    url = _api("/task")
     params = {"agent": AGENT_NAME, "wait_ms": WAIT_MS}
-    code, body = _get_json(PATH_TASK, params)
 
-    if code != 200:
-        log(f"[agent] task poll failed code={code} body={str(body)[:200]}", key="task_fail", every=1.0)
-        time.sleep(min(1.0, LEASE_IDLE_SEC + random.random() * 0.05))
+    code, body = _get_json(url, params)
+
+    # controller may use 204 for no work, or 200 with empty payload
+    if code == 204:
         return None
 
-    if not isinstance(body, dict):
-        log(f"[agent] task poll non-json: {str(body)[:120]}", key="task_nonjson", every=1.0)
-        time.sleep(LEASE_IDLE_SEC)
+    if code != 200 or not isinstance(body, dict):
+        log(f"[agent] task poll failed code={code} body={str(body)[:200]}", "task_fail", every=1.0)
         return None
 
+    # “no work” often comes back as dict missing op
     if not body.get("op"):
-        time.sleep(LEASE_IDLE_SEC)
         return None
 
     return body
 
+def post_result(task: Dict[str, Any], status: str, result: Any = None, error: Optional[str] = None, meta: Optional[Dict[str, Any]] = None) -> None:
+    url = _api("/result")
 
-def _post_result(task: Dict[str, Any], status: str, result: Any = None, error: Optional[str] = None) -> None:
-    global PATH_RESULT
     task_id = task.get("id") or task.get("job_id") or ""
     job_id = task.get("job_id") or task_id
 
-    payload = {
+    payload: Dict[str, Any] = {
         "agent": AGENT_NAME,
         "task_id": task_id,
         "id": task_id,
         "job_id": job_id,
-        "status": status,
+        "status": status,        # "ok" or "error"
         "result": result,
         "error": error,
+        "ts": time.time(),
     }
+    if meta:
+        payload["meta"] = meta
 
-    code, body = _post_json(PATH_RESULT or "/result", payload)
-    if code == 404:
-        PATH_RESULT = "/result"
-        code, body = _post_json(PATH_RESULT, payload)
-
+    code, body = _post_json(url, payload)
     if code != 200:
-        log(f"[agent] post result failed code={code} body={str(body)[:200]}", key="res_fail", every=1.0)
+        log(f"[agent] post result failed code={code} body={str(body)[:200]}", "res_fail", every=1.0)
 
 
-# ---------------- worker loop ----------------
+# ---------------- execution ----------------
 
-def _run_task(task: Dict[str, Any]) -> None:
-    op = task.get("op")
-    payload = task.get("payload") or {}
+def _run_op_in_proc(op: str, payload: Any) -> Any:
+    fn = OPS.get(op)
+    if not fn:
+        raise RuntimeError(f"unknown op: {op}")
+    return fn(payload)
 
-    if op not in OPS:
-        _post_result(task, status="error", result=None, error=f"unknown op: {op}")
+def execute_task(task: Dict[str, Any]) -> None:
+    op = str(task.get("op") or "")
+    payload = task.get("payload")
+
+    if not op:
+        post_result(task, status="error", result=None, error="malformed task: missing op")
         return
 
     _inflight_inc()
+    t0 = time.time()
     try:
-        fn = OPS[op]
-        # Run CPU work in the process pool (true parallelism; bypasses GIL)
-        try:
-            fut = _CPU_POOL.submit(fn, payload)
-            out = fut.result()
-        except NameError:
-            # Pool not defined for some reason; fall back to in-thread execution
-            out = fn(payload)
-
-        _post_result(task, status="ok", result=out, error=None)
+        fut = _CPU_POOL.submit(_run_op_in_proc, op, payload)
+        out = fut.result(timeout=TASK_EXEC_TIMEOUT_SEC)
+        ms = (time.time() - t0) * 1000.0
+        post_result(task, status="ok", result=out, error=None, meta={"op": op, "ms": ms})
+    except FuturesTimeoutError:
+        ms = (time.time() - t0) * 1000.0
+        post_result(task, status="error", result=None, error=f"timeout after {TASK_EXEC_TIMEOUT_SEC}s", meta={"op": op, "ms": ms})
     except Exception as e:
-        _post_result(task, status="error", result=None, error=str(e))
+        ms = (time.time() - t0) * 1000.0
+        post_result(task, status="error", result=None, error=str(e), meta={"op": op, "ms": ms})
     finally:
         _inflight_dec()
 
 
+# ---------------- dynamic workers ----------------
+
+_worker_lock = threading.Lock()
+_worker_threads: Dict[int, threading.Thread] = {}
+_worker_stops: Dict[int, threading.Event] = {}
+
 def worker_loop(worker_id: int, my_stop: threading.Event) -> None:
-    log(f"[agent] worker loop starting id={worker_id}", key=f"wstart{worker_id}", every=999999)
+    log(f"[agent] worker-{worker_id} start", f"wstart{worker_id}", every=999999)
     while not stop_event.is_set() and not my_stop.is_set():
-        task = _lease_task()
-        if task is None:
+        task = lease_task()
+        if task:
+            _note_hit()
+            execute_task(task)
+        else:
             _note_miss()
-            continue
-        _note_hit()
-        _run_task(task)
-
-
-def _prune_dead_workers_locked() -> None:
-    dead = [wid for wid, t in _worker_threads.items() if not t.is_alive()]
-    for wid in dead:
-        _worker_threads.pop(wid, None)
-        _worker_stops.pop(wid, None)
-
+            stop_event.wait(LEASE_IDLE_SEC * (0.6 + random.random() * 0.8))
+    log(f"[agent] worker-{worker_id} stop", f"wstop{worker_id}", every=999999)
 
 def _spawn_one_locked() -> None:
-    # assumes _worker_lock held
     wid = (max(_worker_threads.keys()) + 1) if _worker_threads else 0
     ev = threading.Event()
     t = threading.Thread(target=worker_loop, args=(wid, ev), daemon=True)
@@ -463,142 +387,113 @@ def _spawn_one_locked() -> None:
     _worker_threads[wid] = t
     t.start()
 
-
 def _reap_one_locked() -> None:
-    # assumes _worker_lock held
     if len(_worker_threads) <= CPU_MIN_WORKERS:
         return
     wid = max(_worker_threads.keys())
-    ev = _worker_stops.get(wid)
-    if ev:
-        ev.set()
+    _worker_stops[wid].set()
 
-
-def _count_workers_locked() -> int:
-    return len(_worker_threads)
-
-
-# ---------------- autoscaler ----------------
+def _prune_dead_locked() -> None:
+    dead = [wid for wid, t in _worker_threads.items() if not t.is_alive()]
+    for wid in dead:
+        _worker_threads.pop(wid, None)
+        _worker_stops.pop(wid, None)
 
 def _cpu_ok_to_grow() -> bool:
     if psutil is None:
         return True
     try:
-        pct = float(psutil.cpu_percent(interval=None))
-        return pct < TARGET_CPU_UTIL_PCT
+        return float(psutil.cpu_percent(interval=None)) < TARGET_CPU_UTIL_PCT
     except Exception:
         return True
-
 
 def autoscale_loop() -> None:
     idle_streak = 0
 
     while not stop_event.is_set():
-        time.sleep(SCALE_TICK_SEC)
-
+        stop_event.wait(SCALE_TICK_SEC)
         h, m, inf = _snap_signals()
         cpu_ok = _cpu_ok_to_grow()
 
         with _worker_lock:
-            _prune_dead_workers_locked()
-            cur = _count_workers_locked()
+            _prune_dead_locked()
+            cur = len(_worker_threads)
 
-            # never allow 0
             if cur == 0:
                 for _ in range(CPU_MIN_WORKERS):
                     _spawn_one_locked()
-                _prune_dead_workers_locked()
-                cur = _count_workers_locked()
+                _prune_dead_locked()
+                cur = len(_worker_threads)
 
-            # idle detection: no hits and nothing inflight
+            # idle means: no new work and nothing running
             if h == 0 and inf == 0:
                 idle_streak += 1
             else:
                 idle_streak = 0
 
-            # grow when work exists and cpu is not pinned
-            # heuristic: if we’re seeing hits roughly at our current worker count,
-            # we likely have bubbles to fill.
+            # scale up if we saw work roughly at our current concurrency and CPU isn't pinned
             if cpu_ok and h >= max(1, cur):
-                # add a small step each tick, exploring toward the pipeline region
                 for _ in range(SPAWN_STEP):
-                    cur = _count_workers_locked()
-                    if cur >= WORKER_SOFT_GUARD:
+                    if len(_worker_threads) >= SOFT_GUARD:
                         break
                     _spawn_one_locked()
 
-            # reap when idle for a while (one step at a time)
+            # scale down slowly after sustained idle
             if idle_streak >= IDLE_REAP_TICKS:
                 for _ in range(REAP_STEP):
                     _reap_one_locked()
                 idle_streak = 0
 
-            _prune_dead_workers_locked()
-            set_current_workers(_count_workers_locked())
+            _prune_dead_locked()
+            cur = len(_worker_threads)
 
-        # light telemetry
         log(
-            f"[agent] scale tick: workers={get_current_workers()} hits={h} inflight={inf} cpu_ok={cpu_ok} target_inflight≈{TARGET_INFLIGHT_WORKERS}",
-            key="scale",
+            f"[agent] scale: workers={cur} hits={h} inflight={inf} cpu_ok={cpu_ok} target_inflight≈{TARGET_INFLIGHT} guard={SOFT_GUARD}",
+            "scale",
             every=5.0,
         )
 
-
-def start_dynamic_workers() -> None:
+def start_workers() -> None:
     with _worker_lock:
         for _ in range(CPU_MIN_WORKERS):
             _spawn_one_locked()
-        _prune_dead_workers_locked()
-        set_current_workers(_count_workers_locked())
+        _prune_dead_locked()
 
 
-# ---------------- signals ----------------
+# ---------------- signals / main ----------------
 
-def _handle_sigterm(signum: int, frame: Any) -> None:
+def shutdown(signum: int, frame: Any) -> None:
+    log(f"[agent] shutdown signal {signum}", "shutdown", every=999999)
     stop_event.set()
 
+signal.signal(signal.SIGINT, shutdown)
+signal.signal(signal.SIGTERM, shutdown)
 
-signal.signal(signal.SIGTERM, _handle_sigterm)
-signal.signal(signal.SIGINT, _handle_sigterm)
+def main() -> int:
+    # register (blocking until success)
+    register_loop()
 
-
-# ---------------- main ----------------
-
-def heartbeat_loop() -> None:
-    while not stop_event.is_set():
-        _heartbeat()
-        time.sleep(HEARTBEAT_SEC)
-
-
-def main() -> None:
-    _probe_paths()
-
-    while not stop_event.is_set():
-        if _register_once():
-            break
-        time.sleep(1.0 + random.random() * 0.5)
-
+    # heartbeat + workers + scaler
     threading.Thread(target=heartbeat_loop, daemon=True).start()
-
-    # start dynamic worker system
-    start_dynamic_workers()
+    start_workers()
     threading.Thread(target=autoscale_loop, daemon=True).start()
 
     log(
-        f"[agent] dynamic workers active: usable_cores={USABLE_CORES} pipeline_factor={CPU_PIPELINE_FACTOR} "
-        f"target_inflight≈{TARGET_INFLIGHT_WORKERS} soft_guard={WORKER_SOFT_GUARD} min_workers={CPU_MIN_WORKERS}",
-        key="dyn_start",
+        f"[agent] up name={AGENT_NAME} base={CONTROLLER_BASE} prefix='{API_PREFIX or '(none)'}' "
+        f"usable_cores={USABLE_CORES} ops={TASKS}",
+        "up",
         every=999999,
     )
 
     try:
         while not stop_event.is_set():
-            time.sleep(0.5)
+            stop_event.wait(0.5)
     finally:
         try:
-            _CPU_POOL.shutdown(wait=True, cancel_futures=True)
+            _CPU_POOL.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
+    return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
