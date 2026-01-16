@@ -1,12 +1,20 @@
-# app.py — MYZEL CPU Agent (controller-aligned, no fantasy endpoints)
+# app.py — MYZEL CPU Agent (best-of-both: legacy register/heartbeat + v1 lease/results)
 #
-# Contract (what your controller actually serves):
+# Legacy contract (works in your current controller logs):
 #   - Register:   POST  {prefix}/agents/register
 #   - Heartbeat:  POST  {prefix}/agents/heartbeat
 #   - Lease task: GET   {prefix}/task?agent=NAME&wait_ms=MS
 #   - Result:     POST  {prefix}/result
 #
-# prefix is typically "/api" (but we auto-detect).
+# V1 contract (target control plane):
+#   - Lease:      POST  /v1/leases
+#   - Results:    POST  /v1/results
+#
+# Notes:
+# - V1 endpoints are ROOT mounted (based on your live /v1/jobs usage).
+# - This agent uses v1 leasing/results by default (AGENT_USE_V1=1), but can be toggled off.
+# - It will NOT double-poll. If v1 leasing is enabled, it will not hit legacy /task at all.
+# - If v1 results post fails, it falls back to legacy /result.
 
 import os
 import time
@@ -41,6 +49,9 @@ HEARTBEAT_SEC = float(os.getenv("HEARTBEAT_SEC", "3"))
 WAIT_MS = int(os.getenv("WAIT_MS", "2000"))
 LEASE_IDLE_SEC = float(os.getenv("LEASE_IDLE_SEC", "0.05"))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "6"))
+
+# v1 toggle (default ON)
+AGENT_USE_V1 = os.getenv("AGENT_USE_V1", "1").strip().lower() not in ("0", "false", "no")
 
 # scaling knobs (agent-local)
 CPU_MIN_WORKERS = max(1, int(os.getenv("CPU_MIN_WORKERS", "1")))
@@ -164,7 +175,7 @@ def _candidate_bases() -> List[str]:
     bases.append("http://172.17.0.1:8080")
     bases.append("http://172.18.0.1:8080")
 
-    # sometimes people run it on the host IP and expect containers to route there
+    # host IP override
     host_ip = os.getenv("CONTROLLER_HOST_IP", "").strip()
     if host_ip:
         bases.append(f"http://{host_ip}:8080")
@@ -186,12 +197,23 @@ def _try_get(base: str, path: str) -> Optional[int]:
         return None
 
 def _pick_controller_base() -> str:
-    for base in _candidate_bases():
+    candidates = _candidate_bases()
+
+    # 1) root healthz
+    for base in candidates:
         code = _try_get(base, "/healthz")
         if code is not None and code < 500:
-            log(f"[agent] controller base = {base}", "base", every=999999)
+            log(f"[agent] controller base (root) = {base}", "base", every=999999)
             return base
-    # last resort: whatever env said, even if empty
+
+    # 2) namespaced healthz
+    for base in candidates:
+        code = _try_get(base, "/api/v1/healthz")
+        if code is not None and code < 500:
+            log(f"[agent] controller base (v1 ns) = {base}", "base", every=999999)
+            return base
+
+    # last resort
     base = _normalize_base(os.getenv("CONTROLLER_URL", "http://controller:8080"))
     log(f"[agent] WARNING: could not probe controller; using {base}", "base_warn", every=999999)
     return base
@@ -199,25 +221,36 @@ def _pick_controller_base() -> str:
 CONTROLLER_BASE = _pick_controller_base()
 
 def _detect_prefix() -> str:
-    # prefer /api if it exists
-    for pref in ("/api", ""):
+    # 0) Allow explicit override
+    env_prefix = os.getenv("API_PREFIX")
+    if env_prefix is not None:
+        return env_prefix
+
+    # 1) Prefer /api/v1 if exists, else /api, else root
+    for pref in ("/api/v1", "/api", ""):
         code = _try_get(CONTROLLER_BASE, f"{pref}/healthz" if pref else "/healthz")
         if code is not None and code < 500:
             log(f"[agent] api prefix = '{pref or '(none)'}'", "prefix", every=999999)
             return pref
+
+    # if all probes fail, default to /api (matches your legacy contract more safely)
     return "/api"
 
 API_PREFIX = _detect_prefix()
-
-def _url(path: str) -> str:
-    if not path.startswith("/"):
-        path = "/" + path
-    return f"{CONTROLLER_BASE}{path}"
 
 def _api(path: str) -> str:
     if not path.startswith("/"):
         path = "/" + path
     return f"{CONTROLLER_BASE}{API_PREFIX}{path}" if API_PREFIX else f"{CONTROLLER_BASE}{path}"
+
+def _root(path: str) -> str:
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{CONTROLLER_BASE}{path}"
+
+# v1 endpoints are root-mounted
+V1_LEASE_URL = _root("/v1/leases")
+V1_RESULTS_URL = _root("/v1/results")
 
 
 # ---------------- HTTP helpers ----------------
@@ -272,7 +305,7 @@ def register_loop() -> None:
         if code == 200:
             log(f"[agent] registered as {AGENT_NAME} ops={TASKS}", "reg_ok", every=999999)
             return
-        log(f"[agent] register failed code={code} body={str(body)[:240]}", "reg_fail", every=2.0)
+        log(f"[agent] register failed code={code} url={url} body={str(body)[:240]}", "reg_fail", every=2.0)
         stop_event.wait(1.0 + random.random() * 0.5)
 
 def heartbeat_loop() -> None:
@@ -284,13 +317,14 @@ def heartbeat_loop() -> None:
             log(f"[agent] heartbeat failed code={code} body={str(body)[:160]}", "hb_fail", every=2.0)
         stop_event.wait(HEARTBEAT_SEC)
 
-def lease_task() -> Optional[Dict[str, Any]]:
+# --- legacy leasing/result ---
+
+def lease_task_legacy() -> Optional[Dict[str, Any]]:
     url = _api("/task")
     params = {"agent": AGENT_NAME, "wait_ms": WAIT_MS}
 
     code, body = _get_json(url, params)
 
-    # controller may use 204 for no work, or 200 with empty payload
     if code == 204:
         return None
 
@@ -298,13 +332,18 @@ def lease_task() -> Optional[Dict[str, Any]]:
         log(f"[agent] task poll failed code={code} body={str(body)[:200]}", "task_fail", every=1.0)
         return None
 
-    # “no work” often comes back as dict missing op
     if not body.get("op"):
         return None
 
     return body
 
-def post_result(task: Dict[str, Any], status: str, result: Any = None, error: Optional[str] = None, meta: Optional[Dict[str, Any]] = None) -> None:
+def post_result_legacy(
+    task: Dict[str, Any],
+    status: str,
+    result: Any = None,
+    error: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
     url = _api("/result")
 
     task_id = task.get("id") or task.get("job_id") or ""
@@ -315,7 +354,7 @@ def post_result(task: Dict[str, Any], status: str, result: Any = None, error: Op
         "task_id": task_id,
         "id": task_id,
         "job_id": job_id,
-        "status": status,        # "ok" or "error"
+        "status": status,  # "ok" or "error"
         "result": result,
         "error": error,
         "ts": time.time(),
@@ -326,6 +365,89 @@ def post_result(task: Dict[str, Any], status: str, result: Any = None, error: Op
     code, body = _post_json(url, payload)
     if code != 200:
         log(f"[agent] post result failed code={code} body={str(body)[:200]}", "res_fail", every=1.0)
+
+# --- v1 leasing/result ---
+
+def lease_task_v1() -> Optional[Dict[str, Any]]:
+    payload = {
+        "agent": AGENT_NAME,
+        "capabilities": {"ops": TASKS},
+        "max_tasks": 1,
+        "timeout_ms": WAIT_MS,
+    }
+
+    code, body = _post_json(V1_LEASE_URL, payload)
+
+    if code == 204:
+        return None
+
+    if code != 200 or not isinstance(body, dict):
+        log(f"[agent] v1 lease failed code={code} body={str(body)[:200]}", "v1_lease_fail", every=1.0)
+        return None
+
+    lease_id = body.get("lease_id") or body.get("id")
+
+    task = None
+    if isinstance(body.get("task"), dict):
+        task = body["task"]
+    elif isinstance(body.get("tasks"), list) and body["tasks"]:
+        if isinstance(body["tasks"][0], dict):
+            task = body["tasks"][0]
+
+    if not isinstance(task, dict) or not task.get("op"):
+        return None
+
+    if lease_id:
+        task["_lease_id"] = lease_id
+
+    return task
+
+def post_result_v1(
+    task: Dict[str, Any],
+    state: str,  # "succeeded" | "failed"
+    result: Any = None,
+    error: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> bool:
+    job_id = task.get("job_id") or task.get("id") or ""
+    lease_id = task.get("_lease_id") or task.get("lease_id")
+
+    payload: Dict[str, Any] = {
+        "agent": AGENT_NAME,
+        "job_id": job_id,
+        "lease_id": lease_id,
+        "state": state,
+        # tolerant field (some controllers key off this)
+        "status": "completed" if state == "succeeded" else "failed",
+        "result": result,
+        "error": error,
+        "ts": time.time(),
+    }
+    if meta:
+        payload["meta"] = meta
+
+    code, body = _post_json(V1_RESULTS_URL, payload)
+    if code == 200:
+        return True
+
+    log(f"[agent] v1 results failed code={code} body={str(body)[:200]}", "v1_res_fail", every=1.0)
+    return False
+
+def lease_task() -> Optional[Dict[str, Any]]:
+    # No double-polling.
+    if AGENT_USE_V1:
+        return lease_task_v1()
+    return lease_task_legacy()
+
+def post_result(task: Dict[str, Any], ok: bool, out: Any, err: Optional[str], meta: Dict[str, Any]) -> None:
+    if AGENT_USE_V1:
+        state = "succeeded" if ok else "failed"
+        sent = post_result_v1(task, state=state, result=(out if ok else None), error=err, meta=meta)
+        if sent:
+            return
+        # if v1 result post fails, fall back to legacy result so work isn't lost
+
+    post_result_legacy(task, status=("ok" if ok else "error"), result=(out if ok else None), error=err, meta=meta)
 
 
 # ---------------- execution ----------------
@@ -341,7 +463,7 @@ def execute_task(task: Dict[str, Any]) -> None:
     payload = task.get("payload")
 
     if not op:
-        post_result(task, status="error", result=None, error="malformed task: missing op")
+        post_result(task, ok=False, out=None, err="malformed task: missing op", meta={"op": "", "ms": 0.0})
         return
 
     _inflight_inc()
@@ -350,13 +472,13 @@ def execute_task(task: Dict[str, Any]) -> None:
         fut = _CPU_POOL.submit(_run_op_in_proc, op, payload)
         out = fut.result(timeout=TASK_EXEC_TIMEOUT_SEC)
         ms = (time.time() - t0) * 1000.0
-        post_result(task, status="ok", result=out, error=None, meta={"op": op, "ms": ms})
+        post_result(task, ok=True, out=out, err=None, meta={"op": op, "ms": ms})
     except FuturesTimeoutError:
         ms = (time.time() - t0) * 1000.0
-        post_result(task, status="error", result=None, error=f"timeout after {TASK_EXEC_TIMEOUT_SEC}s", meta={"op": op, "ms": ms})
+        post_result(task, ok=False, out=None, err=f"timeout after {TASK_EXEC_TIMEOUT_SEC}s", meta={"op": op, "ms": ms})
     except Exception as e:
         ms = (time.time() - t0) * 1000.0
-        post_result(task, status="error", result=None, error=str(e), meta={"op": op, "ms": ms})
+        post_result(task, ok=False, out=None, err=str(e), meta={"op": op, "ms": ms})
     finally:
         _inflight_dec()
 
@@ -448,7 +570,7 @@ def autoscale_loop() -> None:
             cur = len(_worker_threads)
 
         log(
-            f"[agent] scale: workers={cur} hits={h} inflight={inf} cpu_ok={cpu_ok} target_inflight≈{TARGET_INFLIGHT} guard={SOFT_GUARD}",
+            f"[agent] scale: workers={cur} hits={h} inflight={inf} cpu_ok={cpu_ok} target_inflight≈{TARGET_INFLIGHT} guard={SOFT_GUARD} use_v1={AGENT_USE_V1}",
             "scale",
             every=5.0,
         )
@@ -480,7 +602,8 @@ def main() -> int:
 
     log(
         f"[agent] up name={AGENT_NAME} base={CONTROLLER_BASE} prefix='{API_PREFIX or '(none)'}' "
-        f"usable_cores={USABLE_CORES} ops={TASKS}",
+        f"usable_cores={USABLE_CORES} ops={TASKS} use_v1={AGENT_USE_V1} "
+        f"v1_lease={V1_LEASE_URL} v1_results={V1_RESULTS_URL}",
         "up",
         every=999999,
     )
