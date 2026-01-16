@@ -294,7 +294,7 @@ def register_loop() -> None:
     payload = {
         "agent": AGENT_NAME,
         "labels": AGENT_LABELS,
-        "capabilities": {"ops": TASKS},
+        "capabilities": TASKS
         "worker_profile": WORKER_PROFILE,
         "metrics": _metrics(),
         "ts": time.time(),
