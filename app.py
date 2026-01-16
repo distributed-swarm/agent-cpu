@@ -294,7 +294,7 @@ def register_loop() -> None:
     payload = {
         "agent": AGENT_NAME,
         "labels": AGENT_LABELS,
-        "capabilities": TASKS
+        "capabilities": TASKS,
         "worker_profile": WORKER_PROFILE,
         "metrics": _metrics(),
         "ts": time.time(),
@@ -371,7 +371,7 @@ def post_result_legacy(
 def lease_task_v1() -> Optional[Dict[str, Any]]:
     payload = {
         "agent": AGENT_NAME,
-        "capabilities": {"ops": TASKS},
+        "capabilities": TASKS,
         "max_tasks": 1,
         "timeout_ms": WAIT_MS,
     }
