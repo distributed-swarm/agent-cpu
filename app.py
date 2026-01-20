@@ -45,6 +45,8 @@ AGENT_NAME = os.getenv("AGENT_NAME") or socket.gethostname()
 TASKS_RAW = os.getenv("TASKS", "echo")
 TASKS = [t.strip() for t in TASKS_RAW.split(",") if t.strip()]
 
+CAPABILITIES = {"ops": TASKS}
+
 HEARTBEAT_SEC = float(os.getenv("HEARTBEAT_SEC", "3"))
 WAIT_MS = int(os.getenv("WAIT_MS", "2000"))
 LEASE_IDLE_SEC = float(os.getenv("LEASE_IDLE_SEC", "0.05"))
