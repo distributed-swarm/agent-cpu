@@ -295,6 +295,7 @@ def register_loop() -> None:
     url = _api("/agents/register")
     payload = {
         "agent": AGENT_NAME,
+        "name": AGENT_NAME,
         "labels": AGENT_LABELS,
         "capabilities": CAPABILITIES,
         "worker_profile": WORKER_PROFILE,
