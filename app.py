@@ -314,7 +314,7 @@ def register_loop() -> None:
 def heartbeat_loop() -> None:
     url = _api("/agents/heartbeat")
     while not stop_event.is_set():
-        payload = {"agent": AGENT_NAME, "metrics": _metrics(), "ts": time.time()}
+        payload = {"agent": AGENT_NAME, "name": AGENT_NAME, "metrics": _metrics(), "ts": time.time()}
         code, body = _post_json(url, payload)
         if code != 200:
             log(f"[agent] heartbeat failed code={code} body={str(body)[:160]}", "hb_fail", every=2.0)
