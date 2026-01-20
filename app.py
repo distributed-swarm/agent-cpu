@@ -373,7 +373,7 @@ def post_result_legacy(
 def lease_task_v1() -> Optional[Dict[str, Any]]:
     payload = {
         "agent": AGENT_NAME,
-        "capabilities": TASKS,
+        "capabilities": CAPABILITIES,
         "max_tasks": 1,
         "timeout_ms": WAIT_MS,
     }
