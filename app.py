@@ -151,7 +151,7 @@ def _post_json(path: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
 def _lease_once() -> Optional[Tuple[str, Dict[str, Any]]]:
     payload = {
         "agent": AGENT_NAME,
-        "capabilities": CAPABILITIES_LIST,   # LIST (controller expects list)
+        "capabilities": {"ops": CAPABILITIES_LIST},   # LIST (controller expects list)
         "max_tasks": MAX_TASKS,
         "timeout_ms": LEASE_TIMEOUT_MS,
         # optional fields for the future; safe to include now if controller ignores unknowns:
