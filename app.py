@@ -17,7 +17,7 @@ AGENT_NAME = os.getenv("AGENT_NAME", "cpu-1")
 
 TASKS_RAW = os.getenv("TASKS", "echo")
 TASKS: List[str] = [t.strip() for t in TASKS_RAW.split(",") if t.strip()]
-CAPABILITIES: Dict[str, Any] = {"ops": TASKS}
+CAPABILITIES: List[str] = TASKS
 
 MAX_TASKS = int(os.getenv("MAX_TASKS", "1"))
 WAIT_MS = int(os.getenv("WAIT_MS", "3000"))
