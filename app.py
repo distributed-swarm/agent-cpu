@@ -1,4 +1,3 @@
-cat > ~/agent-cpu/app.py <<'PY'
 #!/usr/bin/env python3
 from __future__ import annotations
 
