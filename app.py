@@ -29,7 +29,7 @@ _STOP = False
 
 def log(msg: str, **kv: Any) -> None:
     extra = (" " + " ".join(f"{k}={v!r}" for k, v in kv.items())) if kv else ""
-    print(f"[agent] {msg}{extra}", flush=True)
+    print(f"[agent-v1] {msg}{extra}", flush=True)
 
 
 def url(path: str) -> str:
